@@ -303,13 +303,38 @@ Topic 이름:
 
 #### taxi-trip-events
 
-현재 프로젝트에서는 하나의 택시 운행에서 발생하는 다음 이벤트를 이 Topic으로 전달할 예정이다.
-
 * trip_started : 승차 시점에 발생하는 운행 시작 이벤트
 * trip_completed : 하차 시점에 발생하는 운행 완료 이벤트
 
-현재까지 Kafka 실행 환경 구성 및 Topic 생성을 완료하였다.
+Kafka 실행 환경 구성 및 Topic 생성을 완료하였다.
 
 다음 단계에서는 Python Producer를 구현하여 Parquet 데이터를 시간 순서대로 읽고,
-trip_started, trip_completed 이벤트로 변환한 뒤 taxi-trip-events Topic으로 전송한다.
+trip_started, trip_completed 이벤트로 변환한 뒤 Kafka Producer를 이용해 taxi-trip-events Topic으로 전송한다.
 
+Kafka Consumer를 실행하여 이벤트가 시간순으로 수신되는지 확인하였다.
+
+### 테스트
+
+초기 테스트에서는 5개의 택시 운행 데이터를 사용하였다.
+
+- 운행 데이터: 5건
+
+- 생성 이벤트: 10건
+
+- 이벤트 유형: trip_started, trip_completed
+
+- 재생 속도: 실제 시간 대비 100배
+
+- Kafka Topic: taxi-trip-events
+
+Kafka Consumer에서 이벤트가 정상적으로 수신되는 것을 확인한다.
+
+### 현재 구현 결과
+
+과거에 저장된 택시 운행 데이터를 단순 배치 데이터로 처리하는 것이 아니라,
+
+실제 차량 이벤트가 발생하는 것처럼 시간순으로 재생하여 Kafka에 전달할 수 있게 되었다.
+
+이를 통해 이후 Spark Streaming을 연결하여 실시간 데이터를 처리하는 구조로
+
+확장할 수 있는 기반을 구성하였다.
