@@ -170,3 +170,146 @@ NYC TLC Yellow Taxi 데이터 중 프로젝트 목적에 필요한 주요 컬럼
 
 이후 프로젝트를 확장하여 호출, 배차 수락, 결제 등 서로 다른 시스템에서 발생하는 이벤트를 다루게 된다면 Topic을 분리하는 방식도 고려할 수 있다.
 
+## 9. Kafka Topic 구성 방식
+
+현재 프로젝트에서는 `taxi-trip-events`라는 하나의 Kafka Topic을 사용한다.
+
+이 Topic에는 하나의 택시 운행 과정에서 발생하는 다음 두 종류의 이벤트를 저장한다.
+
+- `trip_started`: 승차 시점에 발생하는 운행 시작 이벤트
+- `trip_completed`: 하차 시점에 발생하는 운행 완료 이벤트
+
+두 이벤트는 모두 하나의 Taxi Trip에 속하며 이후 동일한 스트리밍 처리 흐름에서 운행 현황과 집계 지표를 계산하는 데 사용하므로 초기에는 하나의 Topic으로 구성한다.
+
+향후 실제 호출 데이터, 차량 위치 데이터, 결제 승인 데이터처럼 발생 주체와 처리 목적이 다른 데이터가 추가될 경우에는 별도의 Topic으로 분리하는 방식을 고려할 수 있다.
+
+
+## 10. Kafka 메시지 설계 (JSON)
+
+NYC Yellow Taxi 원본 데이터의 한 행은 한 번의 완료된 운행 기록이다.
+
+본 프로젝트에서는 과거 운행 기록을 실시간 운행 환경처럼 재생하기 위해 하나의 Trip을 승차 시점의 `trip_started` 이벤트와 하차 시점의 `trip_completed` 이벤트로 재구성한다.
+
+두 이벤트에는 동일한 `trip_id`를 부여하여 하나의 운행에서 발생한 이벤트임을 연결할 수 있도록 한다.
+
+### trip_started
+
+승객이 탑승하여 운행이 시작되는 시점에 발생하는 이벤트이다.
+
+```json
+{
+  "trip_id": "trip_000001",
+  "event_type": "trip_started",
+  "event_time": "2025-01-01T08:10:00",
+  "pickup_location_id": 161
+}
+```
+
+### trip_completed
+
+승객이 하차하여 운행이 종료되는 시점에 발생하는 이벤트이다.
+
+```json
+{
+  "trip_id": "trip_000001",
+  "event_type": "trip_completed",
+  "event_time": "2025-01-01T08:27:00",
+  "dropoff_location_id": 236,
+  "trip_distance": 3.8,
+  "trip_duration_minutes": 17,
+  "fare_amount": 18.5,
+  "tolls_amount": 0.0,
+  "payment_type": 1,
+  "total_amount": 22.3
+}
+```
+
+운행 완료 시점에는 이동 거리, 운행 시간, 운임 등 운행 결과가 확정되므로 해당 정보를 `trip_completed` 이벤트에 포함한다.
+
+`trip_duration_minutes`는 원본 데이터의 승차 시각과 하차 시각 차이를 계산하여 생성한다.
+
+
+## 11. Kafka Producer 처리 흐름
+
+Python Producer는 NYC Yellow Taxi Parquet 데이터를 읽어 과거 운행 기록을 실시간 차량 운행 이벤트처럼 재생하는 역할을 한다.
+
+처리 흐름은 다음과 같다.
+
+1. Parquet 파일을 읽는다.
+2. 각 Taxi Trip에 고유한 `trip_id`를 생성한다.
+3. 각 운행의 승차 시각을 기준으로 `trip_started` 이벤트를 생성한다.
+4. 각 운행의 하차 시각을 기준으로 `trip_completed` 이벤트를 생성한다.
+5. 생성된 이벤트를 `event_time` 기준으로 정렬한다.
+6. 각 이벤트를 JSON 형태로 변환한다.
+7. 이벤트를 시간 순서대로 Kafka의 `taxi-trip-events` Topic에 전송한다.
+
+이를 통해 이미 저장된 과거 운행 데이터를 실제 서비스에서 운행 이벤트가 지속적으로 발생하는 것처럼 재생하고자 한다.
+
+### 이벤트 재생 속도 설계
+
+NYC Yellow Taxi 데이터는 과거 한 달간의 운행 기록이므로 실제 이벤트 발생 시간 간격을 그대로 적용하면 전체 데이터를 재생하는 데 매우 긴 시간이 필요하다.
+
+따라서 본 프로젝트에서는 이벤트의 발생 순서와 상대적인 시간 간격은 유지하면서 시간을 압축하여 재생한다.
+
+기본 재생 속도는 **100배속**으로 설정한다.
+
+예를 들어 실제 데이터에서 두 이벤트 사이의 시간 간격이 100초라면 프로젝트에서는 1초의 간격으로 전송한다.
+
+```text
+실제 데이터
+
+08:00:00  trip_started
+     ↓ 100초
+08:01:40  trip_started
+
+
+100배속 Replay
+
+trip_started
+     ↓ 1초
+trip_started
+```
+이 방식은 실제 이벤트의 시간적 순서는 유지하면서도 짧은 시간 안에 대량의 스트리밍 데이터를 반복적으로 테스트할 수 있다는 장점이 있다.
+
+향후 테스트 목적에 따라 1배속, 10배속, 100배속 등 재생 속도를 변경할 수 있도록 Producer의 설정값으로 관리할 예정이다.
+
+
+## 12. Kafka 구현 및 실행 결과
+
+### Kafka 실행 환경 구성
+
+로컬 환경에서 Kafka를 실행하기 위해 Docker Desktop과 Docker Compose를 사용하였다.
+
+`docker-compose.yml` 파일에 Apache Kafka 실행 환경을 정의하고 Docker Container로 Kafka를 실행하였다.
+
+현재 구성은 학습 및 초기 구현 단계이므로 Kafka Broker 1개로 구성하였다.
+
+### Kafka 실행
+
+Docker Compose를 이용하여 Kafka Container를 실행하였다.
+
+```bash
+docker compose up -d
+```
+실행 후 다음 명령어로 Kafka Container의 실행 상태를 확인하였다.
+
+Kafka Container가 Up 상태인 것을 확인하였다.
+
+### Kafka Topic 생성
+
+택시 운행 과정에서 발생하는 이벤트를 전달하기 위한 Topic을 생성하였다.
+
+Topic 이름:
+
+#### taxi-trip-events
+
+현재 프로젝트에서는 하나의 택시 운행에서 발생하는 다음 이벤트를 이 Topic으로 전달할 예정이다.
+
+* trip_started : 승차 시점에 발생하는 운행 시작 이벤트
+* trip_completed : 하차 시점에 발생하는 운행 완료 이벤트
+
+현재까지 Kafka 실행 환경 구성 및 Topic 생성을 완료하였다.
+
+다음 단계에서는 Python Producer를 구현하여 Parquet 데이터를 시간 순서대로 읽고,
+trip_started, trip_completed 이벤트로 변환한 뒤 taxi-trip-events Topic으로 전송한다.
+
